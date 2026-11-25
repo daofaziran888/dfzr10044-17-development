@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import inspect
 import io
 from typing import Any
 
@@ -92,7 +93,27 @@ def create_entry(module: str, payload: EntryPayload) -> ActionResult:
 
 
 @router.post("/{module}/{entry_id}/actions", response_model=ActionResult)
-def run_action(module: str, entry_id: int, payload: ActionPayload) -> ActionResult:
+async def run_action(module: str, entry_id: int, payload: ActionPayload,
+                     request: Request) -> ActionResult:
     service = require_service(module)
-    entry, message = service.run_action(entry_id, payload.action.strip())
+    # 富动作（如补数批量重建）可在标准 action/remark 之外携带清单；
+    # 仅当领域服务的 run_action 显式接收第三参时才转发原始 JSON。
+    sig = inspect.signature(service.run_action)
+    positional = [
+        p for p in sig.parameters.values()
+        if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    accepts_payload = len(positional) >= 3 or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
+    if accepts_payload:
+        try:
+            raw = await request.json()
+        except Exception:
+            raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+        entry, message = service.run_action(entry_id, payload.action.strip(), raw)
+    else:
+        entry, message = service.run_action(entry_id, payload.action.strip())
     return ActionResult(ok=entry is not None, message=message, entry=entry)

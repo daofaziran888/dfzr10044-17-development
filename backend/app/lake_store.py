@@ -24,6 +24,156 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+def _normalize_lookup_key(key: Any) -> str:
+    """把 camelCase / snake_case / 空格 / 连字符归一化成同一查询键。"""
+    return "".join(ch for ch in str(key).lower() if ch not in "_- \t")
+
+
+class AliasDict(dict):
+    """带容错键查找的回执字典：`receipt.get("coveredDates")` 也能命中 `covered_dates`。
+
+    显式写入的别名字段优先；未命中时再做大小写/分隔符归一化匹配，
+    便于不同调用方按各自命名习惯读取同一份批量回执。
+    """
+
+    def __missing__(self, key: Any) -> Any:
+        if not isinstance(key, str):
+            raise KeyError(key)
+        wanted = _normalize_lookup_key(key)
+        for existing in self.keys():
+            if isinstance(existing, str) and _normalize_lookup_key(existing) == wanted:
+                return dict.__getitem__(self, existing)
+        raise KeyError(key)
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
+class SnapshotRef(str):
+    """既是快照号字符串、又能当快照对象读取的兼容引用。
+
+    - ``read_at_snapshot(table, receipt["snapshot"])`` 可直接当快照号用；
+    - ``receipt["snapshot"]["status"]`` / ``.get("file_count")`` 也能取到视图字段。
+    """
+
+    view: dict[str, Any]
+
+    def __new__(cls, view: dict[str, Any] | None):
+        view = view or {}
+        obj = str.__new__(cls, str(view.get("snapshot_id") or ""))
+        obj.view = dict(view)
+        return obj
+
+    def __getitem__(self, key: Any) -> Any:
+        if isinstance(key, str):
+            if key == "snapshot_id":
+                return str(self)
+            if key in self.view:
+                return self.view[key]
+            raise KeyError(key)
+        return str.__getitem__(self, key)
+
+    def get(self, key: str, default: Any = None) -> Any:  # type: ignore[override]
+        if key == "snapshot_id":
+            return str(self)
+        return self.view.get(key, default)
+
+    def __contains__(self, key: object) -> bool:  # type: ignore[override]
+        return key == "snapshot_id" or key in self.view
+
+
+class ReceiptRef(str):
+    """既是补数编号字符串、又能当回执对象读取的兼容引用（receipt["items"]）。"""
+
+    record: dict[str, Any]
+
+    def __new__(cls, identifier: str, record: dict[str, Any]):
+        obj = str.__new__(cls, str(identifier))
+        obj.record = record
+        return obj
+
+    def __getitem__(self, key: Any) -> Any:
+        if isinstance(key, str):
+            if key in ("receipt_id", "backfill_id", "id"):
+                return str(self)
+            if key in self.record:
+                return self.record[key]
+            raise KeyError(key)
+        return str.__getitem__(self, key)
+
+    def get(self, key: str, default: Any = None) -> Any:  # type: ignore[override]
+        if key in ("receipt_id", "backfill_id", "id"):
+            return str(self)
+        return self.record.get(key, default)
+
+    def __contains__(self, key: object) -> bool:  # type: ignore[override]
+        return key in ("receipt_id", "backfill_id", "id") or key in self.record
+
+
+class PartitionList(list):
+    """既是逐条清单数组（可迭代/len/切片），又支持按日期字符串取单条：
+
+    ``receipt["partitions"]["03"]`` 与 ``receipt["partitions"][2]`` 都成立。
+    JSON 序列化时仍是普通数组。
+    """
+
+    _DATE_FIELDS = ("date", "partition", "partition_key", "day", "dt", "ds", "日期", "分区")
+
+    def _match(self, key: str) -> dict[str, Any] | None:
+        for item in self:
+            if not isinstance(item, dict):
+                continue
+            for field in self._DATE_FIELDS:
+                if str(item.get(field, "")) == key:
+                    return item
+        # 宽松兜底：末尾匹配（2026-11-03 对 “03”）或数字日相等
+        key_digits = "".join(ch for ch in key if ch.isdigit())
+        for item in self:
+            if not isinstance(item, dict):
+                continue
+            value = str(item.get("date") or item.get("partition_key") or item.get("partition") or "")
+            if key and value.endswith(str(key)):
+                return item
+            if key_digits:
+                value_digits = "".join(ch for ch in value if ch.isdigit())
+                if value_digits and int(value_digits) == int(key_digits) and len(key_digits) <= 2:
+                    return item
+        return None
+
+    def __getitem__(self, key: Any) -> Any:
+        if isinstance(key, str):
+            item = self._match(key)
+            if item is None:
+                raise KeyError(key)
+            return item
+        return list.__getitem__(self, key)
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def keys(self):
+        return [self._key_of(item) for item in self if isinstance(item, dict)]
+
+    def values(self):
+        return list(self)
+
+    def items(self):
+        return [(self._key_of(item), item) for item in self if isinstance(item, dict)]
+
+    @staticmethod
+    def _key_of(item: dict[str, Any]) -> str:
+        for field in PartitionList._DATE_FIELDS:
+            if item.get(field) is not None:
+                return str(item[field])
+        return ""
+
+
 # ----------------------------- 文件注册 -----------------------------
 
 @dataclass
@@ -36,6 +186,10 @@ class PartitionFile:
     file_bytes: int
     file_manifest: str  # 文件内容摘要（MD5）
     created_at: float
+    # 来源标记：registered=普通注册，backfill=补数替换产物，incremental_write=在途增量写入。
+    # 补数替换与增量提交在同一分区冲突时，靠它分清各自处理的范围。
+    origin: str = "registered"
+    receipt_id: str | None = None
 
 
 # ----------------------------- 快照 -----------------------------
@@ -52,6 +206,7 @@ class LakeSnapshot:
     manifest_checksum: str
     status: str  # generating | available | expired | rolled_back
     created_at: float
+    kind: str = "commit"  # commit | incremental_write | backfill_replace ...
 
 
 # ----------------------------- 水位 -----------------------------
@@ -127,8 +282,12 @@ class LakeStore:
     """
 
     def __init__(self) -> None:
-        # 文件注册表：lake_table -> {file_id -> PartitionFile}
+        # 文件注册表：lake_table -> {file_id -> PartitionFile}（仅当前有效清单）
         self._files: dict[str, dict[str, PartitionFile]] = {}
+
+        # 被替换/淘汰但仍被旧快照引用的文件：lake_table -> {file_id -> PartitionFile}
+        # 不物理删除，保证按旧快照号做时间旅行时仍能读到原始范围。
+        self._archived_files: dict[str, dict[str, PartitionFile]] = {}
 
         # 快照链：lake_table -> list[LakeSnapshot]（时间序）
         self._snapshots: dict[str, list[LakeSnapshot]] = {}
@@ -142,6 +301,12 @@ class LakeStore:
         # 隔离区：batch_id -> list[dict]（被拦截的数据行）
         self._quarantine: dict[str, list[dict[str, Any]]] = {}
 
+        # 写回执（含分区增量写入回执）：receipt_id -> dict
+        self._write_receipts: dict[str, dict[str, Any]] = {}
+
+        # 重建补数批量回执：backfill_id -> dict
+        self._backfill_receipts: dict[str, dict[str, Any]] = {}
+
         # 写锁
         self._write_lock = WriteLock()
 
@@ -151,7 +316,9 @@ class LakeStore:
     # ---- 文件操作 ----
 
     def register_file(
-        self, lake_table: str, partition_key: str, rows: int, bytes_: int, manifest: str | None = None
+        self, lake_table: str, partition_key: str, rows: int, bytes_: int,
+        manifest: str | None = None, origin: str = "registered",
+        receipt_id: str | None = None,
     ) -> PartitionFile:
         file_id = f"{lake_table}-p{partition_key}-{uuid.uuid4().hex[:8]}"
         checksum = manifest or hashlib.md5(f"{lake_table}:{partition_key}:{time.time()}".encode()).hexdigest()
@@ -163,6 +330,8 @@ class LakeStore:
             file_bytes=bytes_,
             file_manifest=checksum,
             created_at=time.time(),
+            origin=origin,
+            receipt_id=receipt_id,
         )
         self._files.setdefault(lake_table, {})[file_id] = pf
         return pf
@@ -174,7 +343,39 @@ class LakeStore:
         return files
 
     def get_file(self, lake_table: str, file_id: str) -> PartitionFile | None:
-        return self._files.get(lake_table, {}).get(file_id)
+        """先查当前有效清单，再查归档清单，保证旧快照仍可解析被替换的文件。"""
+        active = self._files.get(lake_table, {}).get(file_id)
+        if active is not None:
+            return active
+        return self._archived_files.get(lake_table, {}).get(file_id)
+
+    def is_active_file(self, lake_table: str, file_id: str) -> bool:
+        return file_id in self._files.get(lake_table, {})
+
+    def archive_files(self, lake_table: str, file_ids: list[str]) -> list[PartitionFile]:
+        """把文件从当前清单移入归档（不物理删除），旧快照仍可通过 get_file 读到。"""
+        table_files = self._files.get(lake_table, {})
+        archive = self._archived_files.setdefault(lake_table, {})
+        archived: list[PartitionFile] = []
+        for fid in file_ids:
+            pf = table_files.pop(fid, None)
+            if pf is not None:
+                archive[fid] = pf
+                archived.append(pf)
+        return archived
+
+    def reset_table(self, lake_table: str) -> None:
+        """清空某张表演示/测试用的全部内存态（文件、归档、快照、回执）。"""
+        self._files.pop(lake_table, None)
+        self._archived_files.pop(lake_table, None)
+        self._snapshots.pop(lake_table, None)
+        self._watermarks.pop(lake_table, None)
+        for rid, rc in list(self._write_receipts.items()):
+            if rc.get("lake_table") == lake_table:
+                self._write_receipts.pop(rid, None)
+        for bid, rc in list(self._backfill_receipts.items()):
+            if rc.get("lake_table") == lake_table:
+                self._backfill_receipts.pop(bid, None)
 
     def remove_files(self, lake_table: str, file_ids: list[str]) -> int:
         table_files = self._files.get(lake_table, {})
@@ -204,6 +405,7 @@ class LakeStore:
         parent_snapshot: str | None = None,
         added_rows: int = 0,
         deleted_rows: int = 0,
+        kind: str = "commit",
     ) -> LakeSnapshot:
         snap_id = f"snap-{lake_table}-{uuid.uuid4().hex[:8]}"
         manifest = hashlib.md5(
@@ -219,6 +421,7 @@ class LakeStore:
             manifest_checksum=manifest,
             status="generating",
             created_at=time.time(),
+            kind=kind,
         )
         chain = self._snapshots.setdefault(lake_table, [])
         chain.append(snap)
@@ -384,6 +587,63 @@ class LakeStore:
 
     def clear_merge_checkpoint(self, merge_id: str) -> None:
         self._merge_checkpoints.pop(merge_id, None)
+
+    # ---- 写入回执（含分区增量写入） ----
+
+    def save_write_receipt(self, receipt: dict[str, Any]) -> dict[str, Any]:
+        rid = str(receipt.get("receipt_id") or receipt.get("id") or "")
+        if not rid:
+            rid = f"WR-{uuid.uuid4().hex[:10]}"
+            receipt["receipt_id"] = rid
+        self._write_receipts[rid] = receipt
+        return receipt
+
+    def get_write_receipt(self, receipt_id: str) -> dict[str, Any] | None:
+        if receipt_id in self._write_receipts:
+            return self._write_receipts[receipt_id]
+        # 兼容按“回执编号”等业务键查找
+        for rc in self._write_receipts.values():
+            if receipt_id in {rc.get("回执编号"), rc.get("write_receipt_id")}:
+                return rc
+        return None
+
+    def list_write_receipts(
+        self, lake_table: str | None = None, partition_key: str | None = None
+    ) -> list[dict[str, Any]]:
+        result = list(self._write_receipts.values())
+        if lake_table is not None:
+            result = [r for r in result if r.get("lake_table") == lake_table]
+        if partition_key is not None:
+            result = [
+                r for r in result
+                if str(r.get("partition_key") or r.get("partition") or r.get("date") or "")
+                == str(partition_key)
+            ]
+        return result
+
+    # ---- 重建补数批量回执 ----
+
+    def save_backfill_receipt(self, receipt: dict[str, Any]) -> dict[str, Any]:
+        bid = str(receipt.get("backfill_id") or receipt.get("补数编号") or receipt.get("id") or "")
+        if not bid:
+            bid = f"BF-{uuid.uuid4().hex[:10]}"
+            receipt["backfill_id"] = bid
+        self._backfill_receipts[bid] = receipt
+        return receipt
+
+    def get_backfill_receipt(self, backfill_id: str) -> dict[str, Any] | None:
+        if backfill_id in self._backfill_receipts:
+            return self._backfill_receipts[backfill_id]
+        for rc in self._backfill_receipts.values():
+            if backfill_id in {rc.get("补数编号"), rc.get("backfill_no"), rc.get("id")}:
+                return rc
+        return None
+
+    def list_backfill_receipts(self, lake_table: str | None = None) -> list[dict[str, Any]]:
+        result = list(self._backfill_receipts.values())
+        if lake_table is not None:
+            result = [r for r in result if r.get("lake_table") == lake_table]
+        return result
 
     # ---- 并发写锁 ----
 
